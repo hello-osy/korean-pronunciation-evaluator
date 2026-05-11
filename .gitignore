@@ -1,0 +1,134 @@
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Python build files
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.crt
+*.token
+secrets.json
+config.local.json
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Audio files
+# Large raw speech data should not be committed
+# =========================
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+
+# =========================
+# Dataset folders
+# =========================
+Sample/
+label_speech_RU/
+sound_speech_RU/
+data/
+dataset/
+datasets/
+
+# =========================
+# Evaluation artifacts
+# =========================
+artifacts/
+batch_eval_results/
+outputs/
+results/
+runs/
+
+# =========================
+# Model checkpoints / weights
+# =========================
+checkpoints/
+models/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+# =========================
+# HuggingFace / Torch cache
+# =========================
+.huggingface/
+hf_cache/
+torch_cache/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+*.ipynb
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+*.tmp
+
+# =========================
+# Keep example files if needed
+# =========================
+!sample_data/
+!examples/
+!README.md
+!requirements.txt
+
+# osy
+Sample
