@@ -2,6 +2,10 @@
 
 `files_for_backend` 폴더만 전달받아 백엔드에서 사용하는 기준의 간단 설명서입니다.
 
+## 데이터셋
+https://www.notion.so/260512-35d4af7a2973801098a4f089aec92b3b?source=copy_link 이 링크에 러시아 화자의 한국어 발화 데이터가 있습니다
+
+
 ## 1. 환경 세팅 방법
 
 `files_for_backend` 폴더 안에서 실행합니다.
