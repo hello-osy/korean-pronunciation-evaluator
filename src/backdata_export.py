@@ -227,6 +227,10 @@ def _resolve_audio_suffix(audio_source_name: str | None, source_audio_path: str 
             return suffix
     return ".wav"
 
+def _infer_score_is_final(result: EvaluationResult) -> bool:
+    if result.score_breakdown is None:
+        return False
+    return bool(result.debug.get("score_is_final", result.evaluation_status == "ready"))
 
 def build_evaluation_backdata(
     result: EvaluationResult,
@@ -263,7 +267,11 @@ def build_evaluation_backdata(
         "status": result.evaluation_status,
         "status_message": result.status_message,
         "score_source": "coarse_token_alignment",
-        "score_note": "Scores are computed from weighted IPA token alignment. Forced alignment is used for timing/prosody and confidence gating.",
+        "score_is_final": _infer_score_is_final(result),
+        "score_note": (
+            "Scores are computed from weighted IPA token alignment. "
+            "If score_is_final is false, this score is only a debug/reference score."
+        ),
         "score_breakdown": _serialize_score_breakdown(result.score_breakdown),
         "gate_summary": gate_summary,
         "mismatches": mismatch_steps,
@@ -316,7 +324,12 @@ def build_evaluation_backdata(
         },
         "evaluation": {
             "score_source": "coarse_token_alignment",
-            "score_note": "Scores are computed from weighted IPA token alignment. Forced alignment is used for timing/prosody and confidence gating.",
+            "score_is_final": _infer_score_is_final(result),
+            "score_note": (
+                "Scores are computed from weighted IPA token alignment. "
+                "Forced alignment is used for timing/prosody and confidence gating. "
+                "If score_is_final is false, the score is provided only for debugging."
+            ),
             "score_breakdown": _serialize_score_breakdown(result.score_breakdown),
             "feedback_report": feedback_payload,
         },

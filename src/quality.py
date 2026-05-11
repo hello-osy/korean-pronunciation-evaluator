@@ -44,13 +44,10 @@ def assess_alignment_confidence(result: ForcedAlignmentResult) -> AlignmentConfi
     """
     Check whether frame-level forced alignment is reliable enough.
 
-    The old version mostly relied on average token confidence.
-    This version also checks:
-    - low-confidence token ratio
-    - very-low-confidence token ratio
-    - minimum confidence
-    - blank ratio
-    - normalized log probability
+    Policy:
+    - Do not fail only because one token has extremely low confidence.
+    - Use ratios instead of a single minimum value.
+    - Keep thresholds realistic for CTC forced alignment.
     """
 
     reasons: list[str] = []
@@ -65,62 +62,57 @@ def assess_alignment_confidence(result: ForcedAlignmentResult) -> AlignmentConfi
     low_conf_ratio = low_conf_count / token_count
     very_low_conf_ratio = very_low_conf_count / token_count
 
-    # 1. Coverage: most reference tokens should be placed on the timeline.
+    debug_notes: list[str] = []
+
     if result.coverage < 0.90:
         reasons.append(
             f"정답 음소 대부분이 시간축에 안정적으로 배치되지 않았습니다. "
             f"coverage={result.coverage:.3f}"
         )
 
-    # 2. Average token confidence should not be too low.
     if result.avg_token_confidence < 0.45:
         reasons.append(
             f"정렬 경로의 평균 음소 신뢰도가 낮습니다. "
             f"avg_token_confidence={result.avg_token_confidence:.3f}"
         )
 
-    # 3. Too many weakly aligned tokens means forced alignment is not stable.
-    if low_conf_ratio > 0.30:
+    if low_conf_ratio > 0.45:
         reasons.append(
             f"신뢰도 0.20 미만 음소 비율이 높습니다. "
             f"low_conf_ratio={low_conf_ratio:.3f}"
         )
 
-    # 4. Very low confidence tokens are especially suspicious.
-    if very_low_conf_ratio > 0.15:
+    if very_low_conf_ratio > 0.30:
         reasons.append(
             f"신뢰도 0.05 미만 음소 비율이 높습니다. "
             f"very_low_conf_ratio={very_low_conf_ratio:.3f}"
         )
 
-    # 5. If there are many tokens and at least one token is almost impossible,
-    # reject. For very short utterances, do not overreact to a single token.
+    # Warning only, not a hard failure.
     if len(confidences) >= 10 and min_token_confidence < 0.005:
-        reasons.append(
-            f"일부 음소의 forced alignment confidence가 지나치게 낮습니다. "
+        debug_notes.append(
             f"min_token_confidence={min_token_confidence:.6f}"
         )
 
-    # 6. Overall CTC path probability.
-    # The previous -4.5 was too loose for this use case.
     if result.normalized_log_prob < -1.50:
         reasons.append(
             f"전체 정렬 경로의 로그확률이 낮습니다. "
             f"normalized_log_prob={result.normalized_log_prob:.3f}"
         )
 
-    # 7. If almost all frames are blank, phone-level timing is unreliable.
     if result.blank_ratio > 0.97:
         reasons.append(
             f"blank frame 비율이 너무 높습니다. "
             f"blank_ratio={result.blank_ratio:.3f}"
         )
 
-    message = (
-        "forced alignment를 신뢰할 수 있습니다."
-        if not reasons
-        else " ".join(reasons)
-    )
+    if reasons:
+        message = " ".join(reasons)
+    else:
+        message = "forced alignment를 신뢰할 수 있습니다."
+
+    if debug_notes:
+        message = message + " debug: " + ", ".join(debug_notes)
 
     return AlignmentConfidenceReport(
         passed=not reasons,

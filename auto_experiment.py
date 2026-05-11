@@ -136,6 +136,10 @@ def main(limit: int | None = None):
         "audio_quality_passed",
         "coarse_token_alignment_passed",
         "alignment_confidence_passed",
+        "coarse_similarity",
+        "score_is_final",
+        "score_available_for_debug",
+        "alignment_message",
         "artifact_dir",
         "error",
     ]
@@ -171,6 +175,10 @@ def main(limit: int | None = None):
                 "alignment_confidence_passed": "",
                 "artifact_dir": "",
                 "error": "",
+                "coarse_similarity": "",
+                "score_is_final": "",
+                "score_available_for_debug": "",
+                "alignment_message": "",
             }
 
             try:
@@ -209,6 +217,8 @@ def main(limit: int | None = None):
                     or safe_get(result, ["evaluation", "score_breakdown"], {})
                     or {}
                 )
+                evaluation = full_payload.get("evaluation", {}) or result.get("evaluation", {}) or {}
+                debug = full_payload.get("debug", {}) or result.get("debug", {}) or {}
 
                 row["status"] = status
                 row["overall"] = score.get("overall", "")
@@ -226,6 +236,11 @@ def main(limit: int | None = None):
                     or artifact_paths.get("output_dir")
                     or ""
                 )
+
+                row["coarse_similarity"] = safe_get(gates, ["coarse_token_alignment_gate", "normalized_score"], "")
+                row["score_is_final"] = evaluation.get("score_is_final", debug.get("score_is_final", ""))
+                row["score_available_for_debug"] = debug.get("score_available_for_debug", "")
+                row["alignment_message"] = safe_get(gates, ["alignment_confidence_gate", "report", "message"], "")
 
                 success_count += 1
 

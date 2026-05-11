@@ -37,14 +37,6 @@ python -c "from pronunciation_backend_pipeline import evaluate_pronunciation_fil
 python -c "from pronunciation_backend_pipeline import evaluate_pronunciation_file; r = evaluate_pronunciation_file(r'sample4.wav', '안녕하세요 저는 오상영입니다'); print(r['status']); print(r['gates']); print(r['artifact_paths'])"
 ```
 
-주요 라이브러리:
-
-- `transformers`, `torch`, `torchaudio`: 음성 phone recognizer 모델 추론
-- `librosa`, `soundfile`: 음성 파일 로딩/전처리
-- `numpy`: forced alignment 및 confidence 계산
-- `regex`: IPA token 처리
-- `IPAkor`: 기존 IPA 변환 호환용
-
 ## 2. 기능 흐름
 
 입력:
