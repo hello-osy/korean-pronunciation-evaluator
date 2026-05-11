@@ -62,22 +62,15 @@ python -c "from pronunciation_backend_pipeline import evaluate_pronunciation_fil
 전체 흐름:
 
 ```text
-audio_path + reference_text
--> evaluate_pronunciation_file() : 백엔드에서 호출하는 메인 함수. 전체 평가 실행, 저장, 최종 dict 반환
--> run_evaluation() : 실제 평가 파이프라인 실행. gate 실패 시 retry/discarded로 조기 반환
--> build_reference_stage() : 정답 문장을 발음형 후보와 기준 IPA로 변환
--> recognize_audio_stage() : 사용자 음성을 phone/IPA로 추정하고 frame logits/timestamp 보존
--> audio_quality_gate() : 음성이 너무 짧거나 무음에 가까운지 확인. 실패 시 retry
--> recognition_gate() : 사용자 음성에서 token sequence가 나왔는지 확인. 실패 시 retry
--> coarse_token_alignment_stage() : 정답 IPA 후보와 사용자 IPA를 token-level로 거칠게 정렬
--> coarse_token_alignment_gate() : 다른 문장을 읽은 경우를 걸러냄. 실패 시 retry
--> forced_alignment_stage() : 선택된 기준 IPA를 음성 시간축에 forced alignment
--> alignment_confidence_gate() : forced alignment 신뢰도 확인. 실패 시 discarded
--> scoring_and_error_stage() : 발음 점수, mismatch, 오류 유형 생성
--> make_ready_result() : 모든 gate 통과 시 ready 상태의 내부 결과 객체 생성
--> save_backend_artifacts() : artifacts/<시각>/에 JSON과 음성 파일 저장
--> build_backend_payload() : llm_feedback_input/prosody_input 포함 최종 API 반환 dict 생성
--> result dict : status, gates, llm_feedback_input, prosody_input, artifact_paths, full_payload 포함
+1. 사용자의 발화 -> Wav2Vec 모델이 IPA로 변환 
+
+2. 정답 문장 -> 라이브러리 안 쓰고 한국어 발음 규칙에 맞게 Rule-base로 IPA로 변환 
+
+3. 사용자IPA와 정답IPA를 course 정렬(IPA 문자열/토큰끼리 비교. 순서대로 잘 읽었는지 확인하는 느낌) -> 잘되면 강제 정렬(IPA를 실제 음성 시간축에 붙임. 어느 시점에 어느 음소를 말했는지 추정하는 느낌) 
+
+4. 점수 계산 
+
+*참고사항: 중간중간 gate가 있음. gate통과 조건을 만족하지 못하면 다음 단계로 진행하지 않음
 ```
 
 백엔드에서 보통 호출할 함수:
