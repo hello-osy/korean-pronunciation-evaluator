@@ -63,6 +63,16 @@ def assess_alignment_confidence(result: ForcedAlignmentResult) -> AlignmentConfi
     very_low_conf_ratio = very_low_conf_count / token_count
 
     debug_notes: list[str] = []
+    durations = [max(0.0, segment.end_time - segment.start_time) for segment in result.segments]
+    gaps = [
+        max(0.0, result.segments[index].start_time - result.segments[index - 1].end_time)
+        for index in range(1, len(result.segments))
+    ]
+    median_duration = float(np.median(durations)) if durations else 0.0
+    max_duration = max(durations) if durations else 0.0
+    max_gap = max(gaps) if gaps else 0.0
+    max_tail_gap = max(gaps[-2:]) if len(gaps) >= 2 else (gaps[-1] if gaps else 0.0)
+    final_confidences = confidences[-2:]
 
     if result.coverage < 0.90:
         reasons.append(
@@ -104,6 +114,29 @@ def assess_alignment_confidence(result: ForcedAlignmentResult) -> AlignmentConfi
         reasons.append(
             f"blank frame 비율이 너무 높습니다. "
             f"blank_ratio={result.blank_ratio:.3f}"
+        )
+
+    if len(final_confidences) == 2 and all(conf < 0.05 for conf in final_confidences):
+        reasons.append(
+            "Forced alignment confidence is too low on the final phones. "
+            f"final_confidences={[round(conf, 6) for conf in final_confidences]}"
+        )
+
+    if median_duration > 0 and max_duration > max(0.75, median_duration * 8.0):
+        reasons.append(
+            "Forced alignment timing has an abnormally long phone interval. "
+            f"max_duration={max_duration:.3f}, median_duration={median_duration:.3f}"
+        )
+
+    if max_tail_gap > 0.50:
+        reasons.append(
+            "Forced alignment timing has an abnormal gap near the final phones. "
+            f"max_tail_gap={max_tail_gap:.3f}"
+        )
+    elif max_gap > 1.20:
+        reasons.append(
+            "Forced alignment timing has an abnormal internal phone gap. "
+            f"max_gap={max_gap:.3f}"
         )
 
     if reasons:
