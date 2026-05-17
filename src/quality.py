@@ -128,7 +128,7 @@ def assess_alignment_confidence(result: ForcedAlignmentResult) -> AlignmentConfi
             f"max_duration={max_duration:.3f}, median_duration={median_duration:.3f}"
         )
 
-    if max_tail_gap > 0.50:
+    if max_tail_gap > 0.30:
         reasons.append(
             "Forced alignment timing has an abnormal gap near the final phones. "
             f"max_tail_gap={max_tail_gap:.3f}"
