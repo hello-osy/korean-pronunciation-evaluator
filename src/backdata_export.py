@@ -288,6 +288,14 @@ def build_evaluation_backdata(
         ],
         "alignment_confidence": _serialize_alignment_confidence(result.alignment_confidence_report),
     }
+    if result.debug.get("alignment_timing_warnings") is not None:
+        prosody_input["timing_warnings"] = result.debug["alignment_timing_warnings"]
+    if result.debug.get("prosody_alignment_usage") is not None:
+        alignment_usage = result.debug["prosody_alignment_usage"]
+        prosody_input["alignment_usage"] = alignment_usage
+        prosody_input["alignment_for_prosody"] = alignment_usage["alignment_for_prosody"]
+        prosody_input["detailed_timing_allowed"] = alignment_usage["detailed_timing_allowed"]
+        prosody_input["prosody_recommended_usage"] = alignment_usage["recommended_usage"]
 
     payload = {
         "schema_version": SCHEMA_VERSION,

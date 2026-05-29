@@ -2,8 +2,6 @@ from __future__ import annotations
 
 """Frame-level CTC forced alignment for reference IPA tokens."""
 
-from math import inf
-
 import numpy as np
 
 from src.label_to_ipa import ipa_tokens_to_labels
@@ -27,33 +25,44 @@ def _viterbi_ctc_path(log_probs: np.ndarray, target_ids: list[int], blank_id: in
     num_frames = log_probs.shape[0]
     num_states = len(extended)
 
-    dp = np.full((num_frames, num_states), -inf, dtype=np.float64)
-    back = np.full((num_frames, num_states), -1, dtype=np.int32)
+    back_dtype = np.int16 if num_states <= np.iinfo(np.int16).max else np.int32
+    back = np.full((num_frames, num_states), -1, dtype=back_dtype)
+    previous_scores = np.full(num_states, -np.inf, dtype=np.float32)
+    current_scores = np.full(num_states, -np.inf, dtype=np.float32)
 
-    dp[0, 0] = float(log_probs[0, blank_id])
+    previous_scores[0] = float(log_probs[0, blank_id])
     if num_states > 1:
-        dp[0, 1] = float(log_probs[0, extended[1]])
+        previous_scores[1] = float(log_probs[0, extended[1]])
 
     for frame in range(1, num_frames):
+        current_scores.fill(-np.inf)
         for state in range(num_states):
-            candidates = [(dp[frame - 1, state], state)]
+            best_score = previous_scores[state]
+            best_prev = state
             if state - 1 >= 0:
-                candidates.append((dp[frame - 1, state - 1], state - 1))
+                previous_score = previous_scores[state - 1]
+                if previous_score > best_score:
+                    best_score = previous_score
+                    best_prev = state - 1
             if (
                 state - 2 >= 0
                 and extended[state] != blank_id
                 and extended[state] != extended[state - 2]
             ):
-                candidates.append((dp[frame - 1, state - 2], state - 2))
+                skip_score = previous_scores[state - 2]
+                if skip_score > best_score:
+                    best_score = skip_score
+                    best_prev = state - 2
 
-            best_score, best_prev = max(candidates, key=lambda item: item[0])
-            dp[frame, state] = best_score + float(log_probs[frame, extended[state]])
+            current_scores[state] = best_score + float(log_probs[frame, extended[state]])
             back[frame, state] = best_prev
+        previous_scores, current_scores = current_scores, previous_scores
 
-    end_candidates = [(dp[num_frames - 1, num_states - 1], num_states - 1)]
-    if num_states > 1:
-        end_candidates.append((dp[num_frames - 1, num_states - 2], num_states - 2))
-    best_score, best_state = max(end_candidates, key=lambda item: item[0])
+    best_score = previous_scores[num_states - 1]
+    best_state = num_states - 1
+    if num_states > 1 and previous_scores[num_states - 2] > best_score:
+        best_score = previous_scores[num_states - 2]
+        best_state = num_states - 2
 
     states = [best_state]
     state = best_state
@@ -133,19 +142,37 @@ def _segment_boundaries(label_frame_buckets: list[list[int]], num_frames: int) -
 
 def force_align_candidate(
     candidate: PronunciationCandidate,
-    logits: list[list[float]],
+    logits: np.ndarray | list[list[float]],
     frame_timestamps: list[float],
     label_to_id: dict[str, int],
     blank_id: int,
 ) -> ForcedAlignmentResult:
-    if not logits:
+    if logits is None:
         raise ValueError("Forced alignment requires frame-level logits.")
 
     token_symbols = [token.symbol for token in candidate.ipa.tokens]
     labels = ipa_tokens_to_labels(candidate.ipa.tokens)
-    target_ids = [label_to_id[label] for label in labels]
+    if not labels:
+        raise ValueError("Forced alignment requires at least one target label.")
 
-    log_probs = np.asarray(logits, dtype=np.float64)
+    missing_labels = sorted({label for label in labels if label not in label_to_id})
+    if missing_labels:
+        raise ValueError(f"Unsupported alignment label(s): {', '.join(missing_labels)}")
+
+    log_probs = np.asarray(logits, dtype=np.float32)
+    if log_probs.ndim != 2 or log_probs.shape[0] == 0:
+        raise ValueError("Forced alignment requires non-empty 2D frame-level logits.")
+    if len(labels) > log_probs.shape[0]:
+        raise ValueError(
+            f"Too many target labels for forced alignment frames: labels={len(labels)}, frames={log_probs.shape[0]}"
+        )
+
+    target_ids = [label_to_id[label] for label in labels]
+    vocab_size = log_probs.shape[1]
+    invalid_ids = [label for label, label_id in zip(labels, target_ids) if label_id < 0 or label_id >= vocab_size]
+    if blank_id < 0 or blank_id >= vocab_size or invalid_ids:
+        invalid_text = ", ".join(sorted(set(invalid_ids)))
+        raise ValueError(f"Unsupported alignment label(s): {invalid_text or '<blank>'}")
     log_probs = log_probs - np.logaddexp.reduce(log_probs, axis=1, keepdims=True)
 
     states, best_score = _viterbi_ctc_path(log_probs, target_ids, blank_id)
