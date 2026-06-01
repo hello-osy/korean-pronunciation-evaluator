@@ -46,7 +46,7 @@ from src.types import (
 
 
 COARSE_SIMILARITY_THRESHOLD = 75.0
-TAIL_RETRY_MAX_TRIM = 4
+TAIL_RETRY_MAX_TRIM = 2
 
 
 _ALIGNMENT_QUALITY_RANK = {
@@ -158,7 +158,8 @@ def coarse_token_alignment_gate(ctx: PipelineContext) -> EvaluationResult | None
         return None
 
     ctx.acceptance_notes.append(
-        "Coarse IPA similarity gate failed but evaluation continued under soft-accept policy. "
+        "Raw coarse IPA similarity gate failed; forced alignment can recover the coarse gate "
+        "when reference-constrained alignment confidence passes. "
         f"coarse_similarity={ctx.coarse_alignment.normalized_score:.3f}, "
         f"threshold={ctx.coarse_similarity_threshold:.3f}"
     )
@@ -235,15 +236,7 @@ def _tail_region_max_gap(result: ForcedAlignmentResult, trim_count: int) -> floa
 
 def _large_tail_trim_allowed(full_attempt: _AlignmentAttempt, trim_count: int) -> bool:
     segments = full_attempt.result.segments
-    if trim_count <= 2:
-        return True
-    if len(segments) <= trim_count:
-        return False
-
-    final_segments = segments[-trim_count:]
-    consecutive_low_confidence = all(segment.confidence < 0.20 for segment in final_segments)
-    tail_gap_near_trimmed_region = _tail_region_max_gap(full_attempt.result, trim_count) > 0.30
-    return consecutive_low_confidence or tail_gap_near_trimmed_region
+    return 0 < trim_count <= TAIL_RETRY_MAX_TRIM and len(segments) > trim_count
 
 
 def _tail_retry_trim_counts(candidate: PronunciationCandidate, full_attempt: _AlignmentAttempt) -> list[int]:
@@ -327,6 +320,7 @@ def _attempt_note(attempt: _AlignmentAttempt) -> str:
     effective_very_low_ratio = float(
         timing.get("effective_very_low_confidence_ratio", timing.get("very_low_confidence_ratio")) or 0.0
     )
+    pause_compression = (attempt.result.alignment_debug or {}).get("pause_compression") or {}
     return (
         f"{attempt.name}: gate_passed={attempt.confidence.passed}; "
         f"quality={timing.get('quality_level')}; "
@@ -339,7 +333,8 @@ def _attempt_note(attempt: _AlignmentAttempt) -> str:
         f"max_internal_gap={float(timing.get('max_internal_gap') or 0.0):.3f}; "
         f"max_unexplained_internal_gap={float(timing.get('max_unexplained_internal_gap') or 0.0):.3f}; "
         f"pause_gap_count={int(timing.get('pause_gap_count') or 0)}; "
-        f"max_tail_gap={float(timing.get('max_tail_gap') or 0.0):.3f}"
+        f"max_tail_gap={float(timing.get('max_tail_gap') or 0.0):.3f}; "
+        f"pause_frames_removed={int(pause_compression.get('removed_frame_count') or 0)}"
     )
 
 
@@ -410,6 +405,8 @@ def forced_alignment_stage(ctx: PipelineContext) -> EvaluationResult | None:
             ctx.recognition.frame_timestamps or [],
             label_to_id,
             blank_id,
+            frame_confidence=ctx.recognition.frame_confidence,
+            frame_energy=ctx.recognition.frame_energy,
         )
         full_attempt = _make_alignment_attempt("full", full_alignment, evidence=evidence)
         attempts.append(full_attempt)
@@ -434,6 +431,8 @@ def forced_alignment_stage(ctx: PipelineContext) -> EvaluationResult | None:
                         ctx.recognition.frame_timestamps or [],
                         label_to_id,
                         blank_id,
+                        frame_confidence=ctx.recognition.frame_confidence,
+                        frame_energy=ctx.recognition.frame_energy,
                     )
                     retry_attempt = _make_alignment_attempt(
                         f"tail_trim_{trim_count}",
@@ -523,8 +522,10 @@ def make_ready_result(ctx: PipelineContext) -> EvaluationResult:
         and ctx.recognition is not None
     )
     audio_gate_passed = ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None
-    coarse_gate_passed = ctx.coarse_alignment.normalized_score >= ctx.coarse_similarity_threshold
     alignment_gate_passed = ctx.alignment_confidence.passed if ctx.alignment_confidence is not None else False
+    raw_coarse_gate_passed = ctx.coarse_alignment.normalized_score >= ctx.coarse_similarity_threshold
+    coarse_gate_recovered_by_alignment = (not raw_coarse_gate_passed) and alignment_gate_passed
+    coarse_gate_passed = raw_coarse_gate_passed or coarse_gate_recovered_by_alignment
     all_gates_passed = (
         audio_gate_passed is not False
         and coarse_gate_passed
@@ -547,6 +548,8 @@ def make_ready_result(ctx: PipelineContext) -> EvaluationResult:
         debug={
             "audio_quality_gate_passed": audio_gate_passed,
             "coarse_token_alignment_gate_passed": coarse_gate_passed,
+            "raw_coarse_token_alignment_gate_passed": raw_coarse_gate_passed,
+            "coarse_gate_recovered_by_alignment": coarse_gate_recovered_by_alignment,
             "alignment_confidence_gate_passed": alignment_gate_passed,
             "soft_accept_policy_applied": not all_gates_passed,
             "coarse_similarity": ctx.coarse_alignment.normalized_score,
@@ -579,6 +582,12 @@ def make_evaluation_result(
     debug_payload = {
         "raw_label_text": ctx.recognition.raw_label_text,
         "raw_labels": ctx.recognition.raw_labels,
+        "audio_trim": {
+            "start_sec": ctx.recognition.trim_start_sec,
+            "end_sec": ctx.recognition.trim_end_sec,
+            "original_duration_sec": ctx.recognition.original_duration_sec,
+            "trimmed_duration_sec": ctx.recognition.trimmed_duration_sec,
+        },
     }
     if debug:
         debug_payload.update(debug)
@@ -610,9 +619,6 @@ def make_evaluation_result(
             soft_accept_limited_by.append("coarse_alignment")
         if soft_accept_limited_by:
             prosody_usage = dict(prosody_usage)
-            prosody_usage["alignment_for_prosody"] = False
-            prosody_usage["detailed_timing_allowed"] = False
-            prosody_usage["recommended_usage"] = "disabled"
             reasons = list(prosody_usage.get("reasons") or [])
             for reason in soft_accept_limited_by:
                 reason_key = f"{reason}_gate_failed"
@@ -630,6 +636,8 @@ def make_evaluation_result(
             for name in soft_accept_limited_by:
                 limitation_causes[name] = True
             prosody_usage["limitation_causes"] = limitation_causes
+            if prosody_usage.get("recommended_usage") == "full":
+                prosody_usage["recommended_usage"] = "cautious"
         debug_payload["prosody_alignment_usage"] = prosody_usage
     elif status == "ready":
         debug_payload["prosody_alignment_usage"] = decide_prosody_alignment_usage(
@@ -742,6 +750,10 @@ def build_backend_payload(
 
     payload["prosody_input"]["audio_file_path"] = (
         str(saved_audio_path.resolve()) if saved_audio_path is not None else str(audio_path.resolve())
+    )
+    payload["prosody_input"]["audio_trim"] = payload.get("debug", {}).get("audio_trim")
+    payload["prosody_input"]["timing_reference"] = (
+        "trimmed_artifact_audio" if saved_audio_path is not None else "trimmed_audio_coordinates"
     )
     payload["prosody_input"]["reference_phonemes"] = [
         {

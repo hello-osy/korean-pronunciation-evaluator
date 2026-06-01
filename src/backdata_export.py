@@ -7,6 +7,10 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
+from src.quality import trim_audio_edges
 from src.types import (
     AlignmentConfidenceReport,
     AlignmentResult,
@@ -163,6 +167,7 @@ def _serialize_forced_alignment(result: ForcedAlignmentResult | None) -> dict | 
         "avg_token_confidence": result.avg_token_confidence,
         "coverage": result.coverage,
         "blank_ratio": result.blank_ratio,
+        "alignment_debug": result.alignment_debug,
     }
 
 
@@ -218,14 +223,40 @@ def _build_gate_summary(result: EvaluationResult) -> dict:
     }
 
 
-def _resolve_audio_suffix(audio_source_name: str | None, source_audio_path: str | Path | None) -> str:
-    for candidate in (audio_source_name, source_audio_path):
-        if not candidate:
-            continue
-        suffix = Path(candidate).suffix
-        if suffix:
-            return suffix
-    return ".wav"
+def _save_trimmed_audio_copy(source_audio_path: str | Path, audio_path: Path) -> dict:
+    source_audio_path = Path(source_audio_path)
+    raw_audio, sampling_rate = sf.read(str(source_audio_path), always_2d=False)
+    if raw_audio.size == 0:
+        shutil.copy2(source_audio_path, audio_path)
+        return {"trimmed": False, "reason": "empty_audio"}
+
+    if raw_audio.ndim > 1:
+        detection_audio = np.mean(raw_audio, axis=1)
+    else:
+        detection_audio = raw_audio
+    detection_audio = np.asarray(detection_audio, dtype=np.float32)
+    max_abs = float(np.max(np.abs(detection_audio))) if detection_audio.size else 0.0
+    if max_abs > 0.0:
+        detection_audio = detection_audio / max_abs
+
+    _, start_sample, end_sample = trim_audio_edges(detection_audio, int(sampling_rate))
+    trimmed_audio = raw_audio[start_sample:end_sample]
+    if trimmed_audio.size == 0:
+        shutil.copy2(source_audio_path, audio_path)
+        return {"trimmed": False, "reason": "empty_after_trim"}
+
+    sf.write(str(audio_path), trimmed_audio, int(sampling_rate))
+    original_duration_sec = len(raw_audio) / float(sampling_rate)
+    trimmed_duration_sec = len(trimmed_audio) / float(sampling_rate)
+    return {
+        "trimmed": start_sample > 0 or end_sample < len(raw_audio),
+        "start_sec": start_sample / float(sampling_rate),
+        "end_sec": end_sample / float(sampling_rate),
+        "original_duration_sec": original_duration_sec,
+        "trimmed_duration_sec": trimmed_duration_sec,
+        "removed_duration_sec": max(0.0, original_duration_sec - trimmed_duration_sec),
+    }
+
 
 def _infer_score_is_final(result: EvaluationResult) -> bool:
     if result.score_breakdown is None:
@@ -369,10 +400,19 @@ def save_evaluation_bundle(
     audio_path: Path | None = None
     audio_file_name: str | None = None
     if source_audio_path is not None and Path(source_audio_path).exists():
-        audio_suffix = _resolve_audio_suffix(audio_source_name, source_audio_path)
+        audio_suffix = ".wav"
         audio_file_name = f"{artifact_id}{audio_suffix}"
         audio_path = artifact_dir / audio_file_name
-        shutil.copy2(source_audio_path, audio_path)
+        try:
+            artifact_audio_trim = _save_trimmed_audio_copy(source_audio_path, audio_path)
+        except Exception as exc:
+            shutil.copy2(source_audio_path, audio_path)
+            artifact_audio_trim = {
+                "trimmed": False,
+                "fallback": "copy_original",
+                "error": str(exc),
+            }
+        result.debug["artifact_audio_trim"] = artifact_audio_trim
 
     payload = build_evaluation_backdata(
         result,

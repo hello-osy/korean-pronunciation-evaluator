@@ -25,6 +25,38 @@ def calculate_frame_energy(audio: np.ndarray, sampling_rate: int, frame_duration
     return [float(np.sqrt(np.mean(np.square(frame)))) if len(frame) else 0.0 for frame in frames]
 
 
+def trim_audio_edges(
+    audio: np.ndarray,
+    sampling_rate: int,
+    *,
+    frame_duration: float = 0.02,
+    padding_sec: float = 0.15,
+    threshold_floor: float = 0.01,
+    threshold_ratio: float = 0.08,
+) -> tuple[np.ndarray, int, int]:
+    """Trim leading/trailing silence while keeping a small edge padding."""
+
+    if audio.size == 0:
+        return audio, 0, 0
+
+    frame_size = max(1, int(sampling_rate * frame_duration))
+    padding = max(1, int(sampling_rate * padding_sec))
+    frame_energy = calculate_frame_energy(audio, sampling_rate, frame_duration=frame_duration)
+    if not frame_energy:
+        return audio, 0, len(audio)
+
+    threshold = max(threshold_floor, threshold_ratio * max(frame_energy))
+    active_frames = [index for index, energy in enumerate(frame_energy) if energy >= threshold]
+    if not active_frames:
+        return audio, 0, len(audio)
+
+    start_sample = max(0, active_frames[0] * frame_size - padding)
+    end_sample = min(len(audio), (active_frames[-1] + 1) * frame_size + padding)
+    if end_sample <= start_sample:
+        return audio, 0, len(audio)
+    return audio[start_sample:end_sample], start_sample, end_sample
+
+
 def analyze_audio_quality(audio: np.ndarray, sampling_rate: int) -> AudioQualityReport:
     duration_sec = len(audio) / float(sampling_rate) if sampling_rate else 0.0
     rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
@@ -466,8 +498,10 @@ def decide_prosody_alignment_usage(
     pause_limited = pause_gap_count > 0
     gap_limited = warning_gap_count > 0 or large_gap_count >= 3 or unexplained_large_gap_count > 0
     tail_limited = max_tail_gap > large_gap_threshold
+    alignment_gate_limited = alignment_gate_passed is False
 
     limitation_causes = {
+        "alignment_gate": alignment_gate_limited,
         "pause": pause_limited,
         "confidence": confidence_limited or minor_confidence_limited,
         "gap": gap_limited,
@@ -510,14 +544,8 @@ def decide_prosody_alignment_usage(
             reasons=["forced_alignment_missing"],
         )
 
-    if evaluation_status != "ready" or alignment_gate_passed is False:
-        reasons.append("alignment_gate_not_ready")
-        if confidence_limited:
-            reasons.append(f"confidence_limited_{confidence_scope or 'unknown'}")
-        if pause_limited:
-            reasons.append("pause_gap_detected")
-        if tail_limited:
-            reasons.append("tail_gap_detected")
+    if evaluation_status != "ready":
+        reasons.append("evaluation_not_ready")
         return payload(
             alignment_for_prosody=False,
             detailed_timing_allowed=False,
@@ -527,6 +555,8 @@ def decide_prosody_alignment_usage(
 
     if quality_level == "discardable":
         reasons.append("timing_quality_discardable")
+        if alignment_gate_limited:
+            reasons.append("alignment_gate_not_ready")
         if confidence_limited:
             reasons.append(f"confidence_limited_{confidence_scope or 'unknown'}")
         if pause_limited:
@@ -534,13 +564,15 @@ def decide_prosody_alignment_usage(
         if tail_limited:
             reasons.append("tail_gap_detected")
         return payload(
-            alignment_for_prosody=False,
-            detailed_timing_allowed=False,
-            recommended_usage="disabled",
+            alignment_for_prosody=True,
+            detailed_timing_allowed=True,
+            recommended_usage="limited",
             reasons=reasons,
         )
 
     if quality_level == "usable_with_warnings":
+        if alignment_gate_limited:
+            reasons.append("alignment_gate_not_ready")
         if pause_gap_count:
             reasons.append("pause_gap_detected")
         if warning_gap_count:
@@ -552,13 +584,15 @@ def decide_prosody_alignment_usage(
         if confidence_limited:
             reasons.append(f"confidence_limited_{confidence_scope or 'unknown'}")
         return payload(
-            alignment_for_prosody=False,
-            detailed_timing_allowed=False,
+            alignment_for_prosody=True,
+            detailed_timing_allowed=True,
             recommended_usage="limited",
             reasons=reasons or ["timing_quality_usable_with_warnings"],
         )
 
     if quality_level == "minor_warnings":
+        if alignment_gate_limited:
+            reasons.append("alignment_gate_not_ready")
         if pause_gap_count:
             reasons.append("pause_gap_detected")
         if large_gap_count:
@@ -572,6 +606,14 @@ def decide_prosody_alignment_usage(
             detailed_timing_allowed=True,
             recommended_usage="cautious",
             reasons=reasons or ["minor_timing_warning"],
+        )
+
+    if alignment_gate_limited:
+        return payload(
+            alignment_for_prosody=True,
+            detailed_timing_allowed=True,
+            recommended_usage="limited",
+            reasons=["alignment_gate_not_ready"],
         )
 
     return payload(

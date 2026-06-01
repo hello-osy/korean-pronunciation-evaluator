@@ -10,27 +10,21 @@ import torch
 
 from src.audio_to_ipa import AudioToIPARecognizer
 from src.label_to_ipa import decode_label_text
-from src.quality import analyze_audio_quality, calculate_frame_energy
+from src.quality import analyze_audio_quality, trim_audio_edges
 from src.types import AudioRecognitionResult
 
 
-def _trim_audio_for_recognition(audio: np.ndarray, sampling_rate: int) -> tuple[np.ndarray, float]:
-    frame_size = max(1, int(sampling_rate * 0.02))
-    padding = max(1, int(sampling_rate * 0.15))
-    frame_energy = calculate_frame_energy(audio, sampling_rate)
-    if not frame_energy:
-        return audio, 0.0
-
-    threshold = max(0.01, 0.08 * max(frame_energy))
-    active_frames = [index for index, energy in enumerate(frame_energy) if energy >= threshold]
-    if not active_frames:
-        return audio, 0.0
-
-    start_sample = max(0, active_frames[0] * frame_size - padding)
-    end_sample = min(len(audio), (active_frames[-1] + 1) * frame_size + padding)
-    if end_sample <= start_sample:
-        return audio, 0.0
-    return audio[start_sample:end_sample], start_sample / float(sampling_rate)
+def _logit_frame_energy(audio: np.ndarray, frame_count: int) -> list[float]:
+    if frame_count <= 0:
+        return []
+    energies: list[float] = []
+    sample_count = len(audio)
+    for index in range(frame_count):
+        start = int(round(sample_count * index / frame_count))
+        end = int(round(sample_count * (index + 1) / frame_count))
+        frame = audio[start:max(start + 1, end)]
+        energies.append(float(np.sqrt(np.mean(np.square(frame)))) if len(frame) else 0.0)
+    return energies
 
 
 def recognize_audio(recognizer: AudioToIPARecognizer, audio_path: str | Path) -> AudioRecognitionResult:
@@ -41,8 +35,8 @@ def recognize_audio(recognizer: AudioToIPARecognizer, audio_path: str | Path) ->
         audio, sampling_rate = loaded
     else:
         audio, sampling_rate = loaded, 16000
-    quality_report = analyze_audio_quality(audio, sampling_rate)
-    alignment_audio, alignment_offset = _trim_audio_for_recognition(audio, sampling_rate)
+    alignment_audio, trim_start_sample, trim_end_sample = trim_audio_edges(audio, sampling_rate)
+    quality_report = analyze_audio_quality(alignment_audio, sampling_rate)
     inputs = recognizer.processor(alignment_audio, sampling_rate=sampling_rate, return_tensors="pt", padding=True)
     input_values = inputs.input_values.to(recognizer.device)
     attention_mask = inputs.attention_mask.to(recognizer.device) if "attention_mask" in inputs else None
@@ -63,9 +57,10 @@ def recognize_audio(recognizer: AudioToIPARecognizer, audio_path: str | Path) ->
     # boundaries, so the last segment can end exactly at the audio duration.
     frame_count = len(frame_confidence)
     frame_timestamps = [
-        alignment_offset + duration * index / max(1, frame_count)
+        duration * index / max(1, frame_count)
         for index in range(frame_count + 1)
     ]
+    frame_energy = _logit_frame_energy(alignment_audio, frame_count)
 
     return AudioRecognitionResult(
         raw_text=sequence.raw_text,
@@ -75,7 +70,12 @@ def recognize_audio(recognizer: AudioToIPARecognizer, audio_path: str | Path) ->
         raw_labels=raw_labels,
         logits=logits.numpy(),
         frame_confidence=frame_confidence,
+        frame_energy=frame_energy,
         frame_timestamps=frame_timestamps,
         sampling_rate=sampling_rate,
         quality_report=quality_report,
+        trim_start_sec=trim_start_sample / float(sampling_rate),
+        trim_end_sec=trim_end_sample / float(sampling_rate),
+        original_duration_sec=len(audio) / float(sampling_rate),
+        trimmed_duration_sec=duration,
     )
