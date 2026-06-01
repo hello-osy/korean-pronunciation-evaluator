@@ -7,6 +7,7 @@ from collections import Counter
 
 import numpy as np
 
+from src.confidence_calibration import calibration_debug_summary, get_token_thresholds
 from src.types import AlignmentConfidenceReport, AudioQualityReport, ForcedAlignmentResult
 
 
@@ -116,19 +117,44 @@ def _gap_evidence(
     )
 
 
-def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
+def _confidence_issue_summary_for_segments(
+    result: ForcedAlignmentResult,
+    *,
+    calibration_stats: dict | None = None,
+    mode: str = "raw",
+) -> dict:
     segments = result.segments
     confidences = [segment.confidence for segment in segments]
     token_count = max(1, len(confidences))
+    threshold_by_index = []
+    source_counts: Counter[str] = Counter()
+    for segment in segments:
+        if mode == "calibrated":
+            thresholds = get_token_thresholds(
+                calibration_stats,
+                segment.token,
+                default_low_threshold=LOW_CONFIDENCE_THRESHOLD,
+                default_very_low_threshold=VERY_LOW_CONFIDENCE_THRESHOLD,
+            )
+        else:
+            thresholds = {
+                "source": "raw_default",
+                "count": None,
+                "low_threshold": LOW_CONFIDENCE_THRESHOLD,
+                "very_low_threshold": VERY_LOW_CONFIDENCE_THRESHOLD,
+            }
+        threshold_by_index.append(thresholds)
+        source_counts[str(thresholds["source"])] += 1
+
     low_segments = [
         (index, segment)
         for index, segment in enumerate(segments)
-        if segment.confidence < LOW_CONFIDENCE_THRESHOLD
+        if segment.confidence < threshold_by_index[index]["low_threshold"]
     ]
     very_low_segments = [
         (index, segment)
         for index, segment in enumerate(segments)
-        if segment.confidence < VERY_LOW_CONFIDENCE_THRESHOLD
+        if segment.confidence < threshold_by_index[index]["very_low_threshold"]
     ]
     very_low_count = len(very_low_segments)
     low_count = len(low_segments)
@@ -144,6 +170,11 @@ def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
             for _, segment in very_low_segments
             if segment.token == symbol
         ]
+        symbol_thresholds = [
+            threshold_by_index[index]["very_low_threshold"]
+            for index, segment in very_low_segments
+            if segment.token == symbol
+        ]
         dominant_symbols.append(
             {
                 "token": symbol,
@@ -151,6 +182,7 @@ def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
                 "ratio_among_very_low": count / max(1, very_low_count),
                 "min_confidence": min(symbol_confidences) if symbol_confidences else None,
                 "mean_confidence": float(np.mean(symbol_confidences)) if symbol_confidences else None,
+                "mean_very_low_threshold": float(np.mean(symbol_thresholds)) if symbol_thresholds else None,
             }
         )
 
@@ -186,6 +218,9 @@ def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
                 "token": segment.token,
                 "label": segment.label,
                 "confidence": segment.confidence,
+                "low_threshold": threshold_by_index[index]["low_threshold"],
+                "very_low_threshold": threshold_by_index[index]["very_low_threshold"],
+                "threshold_source": threshold_by_index[index]["source"],
                 "start_time": segment.start_time,
                 "end_time": segment.end_time,
             }
@@ -213,6 +248,8 @@ def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
 
     return {
         "scope": scope,
+        "mode": mode,
+        "threshold_source_counts": dict(source_counts),
         "low_confidence_threshold": LOW_CONFIDENCE_THRESHOLD,
         "very_low_confidence_threshold": VERY_LOW_CONFIDENCE_THRESHOLD,
         "token_count": len(segments),
@@ -228,12 +265,44 @@ def _confidence_issue_summary(result: ForcedAlignmentResult) -> dict:
     }
 
 
+def _confidence_issue_summary(
+    result: ForcedAlignmentResult,
+    *,
+    calibration_stats: dict | None = None,
+) -> dict:
+    raw_summary = _confidence_issue_summary_for_segments(result, mode="raw")
+    if not calibration_stats:
+        raw_summary["calibration_enabled"] = False
+        raw_summary["effective_scope"] = raw_summary["scope"]
+        raw_summary["effective_low_confidence_count"] = raw_summary["low_confidence_count"]
+        raw_summary["effective_very_low_confidence_count"] = raw_summary["very_low_confidence_count"]
+        raw_summary["effective_low_confidence_ratio"] = raw_summary["low_confidence_ratio"]
+        raw_summary["effective_very_low_confidence_ratio"] = raw_summary["very_low_confidence_ratio"]
+        return raw_summary
+
+    calibrated_summary = _confidence_issue_summary_for_segments(
+        result,
+        calibration_stats=calibration_stats,
+        mode="calibrated",
+    )
+    raw_summary["calibration_enabled"] = True
+    raw_summary["calibration"] = calibration_debug_summary(calibration_stats)
+    raw_summary["calibrated"] = calibrated_summary
+    raw_summary["effective_scope"] = calibrated_summary["scope"]
+    raw_summary["effective_low_confidence_count"] = calibrated_summary["low_confidence_count"]
+    raw_summary["effective_very_low_confidence_count"] = calibrated_summary["very_low_confidence_count"]
+    raw_summary["effective_low_confidence_ratio"] = calibrated_summary["low_confidence_ratio"]
+    raw_summary["effective_very_low_confidence_ratio"] = calibrated_summary["very_low_confidence_ratio"]
+    return raw_summary
+
+
 def summarize_alignment_timing(
     result: ForcedAlignmentResult,
     *,
     frame_confidence: list[float] | np.ndarray | None = None,
     logits: np.ndarray | list[list[float]] | None = None,
     blank_id: int | None = None,
+    calibration_stats: dict | None = None,
 ) -> dict:
     segments = result.segments
     durations = [max(0.0, segment.end_time - segment.start_time) for segment in segments]
@@ -283,7 +352,14 @@ def summarize_alignment_timing(
     low_confidence_count = sum(conf < LOW_CONFIDENCE_THRESHOLD for conf in confidences)
     very_low_confidence_count = sum(conf < very_low_confidence_threshold for conf in confidences)
     token_count = max(1, len(confidences))
-    confidence_issue_summary = _confidence_issue_summary(result)
+    confidence_issue_summary = _confidence_issue_summary(
+        result,
+        calibration_stats=calibration_stats,
+    )
+    effective_very_low_confidence_ratio = confidence_issue_summary["effective_very_low_confidence_ratio"]
+    effective_low_confidence_ratio = confidence_issue_summary["effective_low_confidence_ratio"]
+    effective_very_low_confidence_count = confidence_issue_summary["effective_very_low_confidence_count"]
+    effective_low_confidence_count = confidence_issue_summary["effective_low_confidence_count"]
 
     large_gaps = [gap for gap in gaps if gap["gap"] > large_gap_threshold]
     severe_gaps = [gap for gap in gaps if gap["gap"] > warning_gap_threshold]
@@ -303,9 +379,9 @@ def summarize_alignment_timing(
 
     if result.coverage < 0.90 or max_tail_gap > large_gap_threshold or max_unexplained_internal_gap > failure_internal_gap_threshold:
         quality_level = "discardable"
-    elif severe_gaps or len(large_gaps) >= 3 or very_low_confidence_count / token_count > 0.15:
+    elif severe_gaps or len(large_gaps) >= 3 or effective_very_low_confidence_ratio > 0.15:
         quality_level = "usable_with_warnings"
-    elif large_gaps or very_low_confidence_count / token_count > 0.10:
+    elif large_gaps or effective_very_low_confidence_ratio > 0.10:
         quality_level = "minor_warnings"
     else:
         quality_level = "clean"
@@ -334,6 +410,21 @@ def summarize_alignment_timing(
         "very_low_confidence_ratio": very_low_confidence_count / token_count,
         "low_confidence_count": low_confidence_count,
         "very_low_confidence_count": very_low_confidence_count,
+        "effective_low_confidence_ratio": effective_low_confidence_ratio,
+        "effective_very_low_confidence_ratio": effective_very_low_confidence_ratio,
+        "effective_low_confidence_count": effective_low_confidence_count,
+        "effective_very_low_confidence_count": effective_very_low_confidence_count,
+        "calibrated_low_confidence_ratio": (
+            (confidence_issue_summary.get("calibrated") or {}).get("low_confidence_ratio")
+            if confidence_issue_summary.get("calibration_enabled")
+            else None
+        ),
+        "calibrated_very_low_confidence_ratio": (
+            (confidence_issue_summary.get("calibrated") or {}).get("very_low_confidence_ratio")
+            if confidence_issue_summary.get("calibration_enabled")
+            else None
+        ),
+        "confidence_calibration": calibration_debug_summary(calibration_stats),
         "confidence_issue_summary": confidence_issue_summary,
         "top_gaps": top_gaps,
     }
@@ -353,9 +444,17 @@ def decide_prosody_alignment_usage(
     unexplained_large_gap_count = int((timing_summary or {}).get("unexplained_large_gap_count") or 0)
     max_tail_gap = float((timing_summary or {}).get("max_tail_gap") or 0.0)
     large_gap_threshold = float((timing_summary or {}).get("large_gap_threshold") or 0.30)
-    very_low_confidence_ratio = float((timing_summary or {}).get("very_low_confidence_ratio") or 0.0)
+    very_low_confidence_ratio = float(
+        (timing_summary or {}).get(
+            "effective_very_low_confidence_ratio",
+            (timing_summary or {}).get("very_low_confidence_ratio") or 0.0,
+        )
+        or 0.0
+    )
     confidence_issue_summary = (timing_summary or {}).get("confidence_issue_summary") or {}
-    confidence_scope = confidence_issue_summary.get("scope")
+    confidence_scope = confidence_issue_summary.get("effective_scope") or confidence_issue_summary.get("scope")
+    raw_confidence_scope = confidence_issue_summary.get("scope")
+    calibrated_confidence_scope = (confidence_issue_summary.get("calibrated") or {}).get("scope")
     confidence_limited = (
         very_low_confidence_ratio > 0.15
         or (confidence_scope in {"global", "mixed"} and very_low_confidence_ratio > 0.0)
@@ -396,6 +495,11 @@ def decide_prosody_alignment_usage(
             "limited_by": limited_by,
             "limitation_causes": limitation_causes,
             "confidence_issue_scope": confidence_scope,
+            "raw_confidence_issue_scope": raw_confidence_scope,
+            "calibrated_confidence_issue_scope": calibrated_confidence_scope,
+            "raw_very_low_confidence_ratio": (timing_summary or {}).get("very_low_confidence_ratio"),
+            "calibrated_very_low_confidence_ratio": (timing_summary or {}).get("calibrated_very_low_confidence_ratio"),
+            "effective_very_low_confidence_ratio": very_low_confidence_ratio,
         }
 
     if not timing_summary:
@@ -484,6 +588,7 @@ def assess_alignment_confidence(
     frame_confidence: list[float] | np.ndarray | None = None,
     logits: np.ndarray | list[list[float]] | None = None,
     blank_id: int | None = None,
+    calibration_stats: dict | None = None,
 ) -> AlignmentConfidenceReport:
     """
     Check whether frame-level forced alignment is reliable enough.
@@ -512,6 +617,7 @@ def assess_alignment_confidence(
         frame_confidence=frame_confidence,
         logits=logits,
         blank_id=blank_id,
+        calibration_stats=calibration_stats,
     )
     median_duration = timing_summary["median_duration"]
     max_duration = timing_summary["max_duration"]
@@ -520,7 +626,13 @@ def assess_alignment_confidence(
     max_unexplained_internal_gap = timing_summary["max_unexplained_internal_gap"]
     pause_gap_count = timing_summary["pause_gap_count"]
     confidence_issue_summary = timing_summary["confidence_issue_summary"]
+    effective_low_conf_ratio = float(timing_summary.get("effective_low_confidence_ratio", low_conf_ratio) or 0.0)
+    effective_very_low_conf_ratio = float(
+        timing_summary.get("effective_very_low_confidence_ratio", very_low_conf_ratio) or 0.0
+    )
+    effective_confidence_scope = confidence_issue_summary.get("effective_scope") or confidence_issue_summary["scope"]
     final_confidences = confidences[-2:]
+    final_segments = result.segments[-2:]
 
     if result.coverage < 0.90:
         reasons.append(
@@ -534,21 +646,32 @@ def assess_alignment_confidence(
             f"avg_token_confidence={result.avg_token_confidence:.3f}"
         )
 
-    if low_conf_ratio > 0.45:
-        reasons.append(
-            f"신뢰도 0.20 미만 음소 비율이 높습니다. "
-            f"low_conf_ratio={low_conf_ratio:.3f}"
+    if low_conf_ratio - effective_low_conf_ratio > 0.05:
+        debug_notes.append(
+            f"calibrated_low_conf_ratio={effective_low_conf_ratio:.3f}, raw_low_conf_ratio={low_conf_ratio:.3f}"
         )
 
-    if very_low_conf_ratio > 0.30:
+    if very_low_conf_ratio - effective_very_low_conf_ratio > 0.05:
+        debug_notes.append(
+            "calibrated_very_low_conf_ratio="
+            f"{effective_very_low_conf_ratio:.3f}, raw_very_low_conf_ratio={very_low_conf_ratio:.3f}"
+        )
+
+    if effective_low_conf_ratio > 0.45:
+        reasons.append(
+            f"신뢰도 0.20 미만 음소 비율이 높습니다. "
+            f"low_conf_ratio={effective_low_conf_ratio:.3f}"
+        )
+
+    if effective_very_low_conf_ratio > 0.30:
         reasons.append(
             f"신뢰도 0.05 미만 음소 비율이 높습니다. "
-            f"very_low_conf_ratio={very_low_conf_ratio:.3f}, "
-            f"scope={confidence_issue_summary['scope']}"
+            f"very_low_conf_ratio={effective_very_low_conf_ratio:.3f}, "
+            f"scope={effective_confidence_scope}"
         )
-    elif very_low_conf_ratio > 0.15:
+    elif effective_very_low_conf_ratio > 0.15:
         debug_notes.append(
-            f"very_low_confidence_scope={confidence_issue_summary['scope']}"
+            f"very_low_confidence_scope={effective_confidence_scope}"
         )
 
     # Warning only, not a hard failure.
@@ -569,7 +692,17 @@ def assess_alignment_confidence(
             f"blank_ratio={result.blank_ratio:.3f}"
         )
 
-    if len(final_confidences) == 2 and all(conf < VERY_LOW_CONFIDENCE_THRESHOLD for conf in final_confidences):
+    final_very_low_flags = []
+    for segment, confidence in zip(final_segments, final_confidences):
+        thresholds = get_token_thresholds(
+            calibration_stats,
+            segment.token,
+            default_low_threshold=LOW_CONFIDENCE_THRESHOLD,
+            default_very_low_threshold=VERY_LOW_CONFIDENCE_THRESHOLD,
+        )
+        final_very_low_flags.append(confidence < thresholds["very_low_threshold"])
+
+    if len(final_confidences) == 2 and all(final_very_low_flags):
         reasons.append(
             "Forced alignment confidence is too low on the final phones. "
             f"final_confidences={[round(conf, 6) for conf in final_confidences]}"

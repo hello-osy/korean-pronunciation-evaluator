@@ -19,6 +19,7 @@ from src import cost_model
 from src.alignment import score_reference_candidates
 from src.audio_to_ipa import AudioToIPARecognizer
 from src.backdata_export import build_evaluation_backdata, save_evaluation_bundle
+from src.confidence_calibration import load_confidence_calibration
 from src.error_analysis import classify_alignment_errors
 from src.feedback_report import build_feedback_report
 from src.forced_alignment import force_align_candidate
@@ -74,8 +75,10 @@ class PipelineContext:
     score_breakdown: ScoreBreakdown | None = None
     feedback_report: FeedbackReport | None = None
     alignment_notes: list[str] = field(default_factory=list)
+    acceptance_notes: list[str] = field(default_factory=list)
     stage_latencies_ms: dict[str, float] = field(default_factory=dict)
     alignment_blank_id: int | None = None
+    alignment_calibration_stats: dict[str, Any] | None = None
 
 
 @dataclass
@@ -108,42 +111,30 @@ def recognize_audio_stage(ctx: PipelineContext) -> None:
 
 
 def audio_quality_gate(ctx: PipelineContext) -> EvaluationResult | None:
-    """Stop early when the audio is too short, silent, or clipped."""
+    """Record audio-quality failures while keeping the evaluation accepted."""
 
     assert ctx.reference is not None and ctx.recognition is not None and ctx.selected_candidate is not None
     report = ctx.recognition.quality_report
     if report is None or report.passed:
         return None
 
-    return make_evaluation_result(
-        ctx,
-        status="retry",
-        message="Audio quality gate failed. Re-recording is recommended.",
-        debug={
-            "audio_quality_gate_passed": False,
-            "coarse_token_alignment_gate_passed": None,
-            "alignment_confidence_gate_passed": None,
-        },
+    ctx.acceptance_notes.append(
+        "Audio quality gate failed but evaluation continued under soft-accept policy."
     )
+    return None
 
 
 def recognition_gate(ctx: PipelineContext) -> EvaluationResult | None:
-    """Stop early when no stable phone/IPA sequence was decoded."""
+    """Record empty recognition output while keeping the evaluation accepted."""
 
     assert ctx.reference is not None and ctx.recognition is not None
     if ctx.recognition.tokens:
         return None
 
-    return make_evaluation_result(
-        ctx,
-        status="retry",
-        message="Could not extract a stable phone/IPA sequence from the audio.",
-        debug={
-            "audio_quality_gate_passed": ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None,
-            "coarse_token_alignment_gate_passed": None,
-            "alignment_confidence_gate_passed": None,
-        },
+    ctx.acceptance_notes.append(
+        "Recognition produced no stable phone tokens but evaluation continued under soft-accept policy."
     )
+    return None
 
 
 def coarse_token_alignment_stage(ctx: PipelineContext) -> None:
@@ -160,25 +151,18 @@ def coarse_token_alignment_stage(ctx: PipelineContext) -> None:
 
 
 def coarse_token_alignment_gate(ctx: PipelineContext) -> EvaluationResult | None:
-    """Filter out utterances that are too different from the reference sentence."""
+    """Record coarse mismatch while keeping the evaluation accepted."""
 
     assert ctx.coarse_alignment is not None and ctx.recognition is not None
     if ctx.coarse_alignment.normalized_score >= ctx.coarse_similarity_threshold:
         return None
 
-    return make_evaluation_result(
-        ctx,
-        status="retry",
-        message="Coarse IPA similarity gate failed. The utterance may not match the reference sentence.",
-        alignment_result=ctx.coarse_alignment,
-        debug={
-            "audio_quality_gate_passed": ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None,
-            "coarse_token_alignment_gate_passed": False,
-            "alignment_confidence_gate_passed": None,
-            "coarse_similarity": ctx.coarse_alignment.normalized_score,
-            "coarse_similarity_threshold": ctx.coarse_similarity_threshold,
-        },
+    ctx.acceptance_notes.append(
+        "Coarse IPA similarity gate failed but evaluation continued under soft-accept policy. "
+        f"coarse_similarity={ctx.coarse_alignment.normalized_score:.3f}, "
+        f"threshold={ctx.coarse_similarity_threshold:.3f}"
     )
+    return None
 
 
 def _unstable_tail_trim_count(result: ForcedAlignmentResult) -> int:
@@ -286,11 +270,13 @@ def _alignment_evidence(ctx: PipelineContext) -> dict[str, Any]:
             "frame_confidence": None,
             "logits": None,
             "blank_id": ctx.alignment_blank_id,
+            "calibration_stats": ctx.alignment_calibration_stats,
         }
     return {
         "frame_confidence": ctx.recognition.frame_confidence,
         "logits": ctx.recognition.logits,
         "blank_id": ctx.alignment_blank_id,
+        "calibration_stats": ctx.alignment_calibration_stats,
     }
 
 
@@ -322,8 +308,8 @@ def _alignment_attempt_rank(attempt: _AlignmentAttempt) -> tuple:
         -int(timing.get("failure_gap_count") or 0),
         -int(timing.get("warning_gap_count") or 0),
         -int(timing.get("large_gap_count") or 0),
-        -float(timing.get("very_low_confidence_ratio") or 0.0),
-        -float(timing.get("low_confidence_ratio") or 0.0),
+        -float(timing.get("effective_very_low_confidence_ratio", timing.get("very_low_confidence_ratio")) or 0.0),
+        -float(timing.get("effective_low_confidence_ratio", timing.get("low_confidence_ratio")) or 0.0),
         -float(timing.get("max_tail_gap") or 0.0),
         -float(timing.get("max_unexplained_internal_gap") or timing.get("max_internal_gap") or 0.0),
         -float(timing.get("max_internal_gap") or 0.0),
@@ -335,14 +321,21 @@ def _alignment_attempt_rank(attempt: _AlignmentAttempt) -> tuple:
 
 def _attempt_note(attempt: _AlignmentAttempt) -> str:
     timing = attempt.timing_summary
-    confidence_scope = (timing.get("confidence_issue_summary") or {}).get("scope")
+    confidence_summary = timing.get("confidence_issue_summary") or {}
+    confidence_scope = confidence_summary.get("effective_scope") or confidence_summary.get("scope")
+    raw_confidence_scope = confidence_summary.get("scope")
+    effective_very_low_ratio = float(
+        timing.get("effective_very_low_confidence_ratio", timing.get("very_low_confidence_ratio")) or 0.0
+    )
     return (
         f"{attempt.name}: gate_passed={attempt.confidence.passed}; "
         f"quality={timing.get('quality_level')}; "
         f"coverage={attempt.result.coverage:.3f}; "
         f"avg_conf={attempt.result.avg_token_confidence:.3f}; "
         f"very_low_ratio={float(timing.get('very_low_confidence_ratio') or 0.0):.3f}; "
+        f"effective_very_low_ratio={effective_very_low_ratio:.3f}; "
         f"confidence_scope={confidence_scope}; "
+        f"raw_confidence_scope={raw_confidence_scope}; "
         f"max_internal_gap={float(timing.get('max_internal_gap') or 0.0):.3f}; "
         f"max_unexplained_internal_gap={float(timing.get('max_unexplained_internal_gap') or 0.0):.3f}; "
         f"pause_gap_count={int(timing.get('pause_gap_count') or 0)}; "
@@ -354,8 +347,20 @@ def _large_tail_trim_has_clear_gain(attempt: _AlignmentAttempt, full_attempt: _A
     if attempt.trim_count <= 2:
         return True
 
-    full_very_low_ratio = float(full_attempt.timing_summary.get("very_low_confidence_ratio") or 0.0)
-    attempt_very_low_ratio = float(attempt.timing_summary.get("very_low_confidence_ratio") or 0.0)
+    full_very_low_ratio = float(
+        full_attempt.timing_summary.get(
+            "effective_very_low_confidence_ratio",
+            full_attempt.timing_summary.get("very_low_confidence_ratio"),
+        )
+        or 0.0
+    )
+    attempt_very_low_ratio = float(
+        attempt.timing_summary.get(
+            "effective_very_low_confidence_ratio",
+            attempt.timing_summary.get("very_low_confidence_ratio"),
+        )
+        or 0.0
+    )
     very_low_improved = full_very_low_ratio - attempt_very_low_ratio >= 0.05
     tail_gap_removed = (
         _tail_region_max_gap(full_attempt.result, attempt.trim_count) > 0.30
@@ -474,25 +479,16 @@ def forced_alignment_stage(ctx: PipelineContext) -> EvaluationResult | None:
                 "with sufficient improvement."
             )
     except ValueError as exc:
-        return make_evaluation_result(
-            ctx,
-            status="discarded",
-            message="Forced alignment failed.",
-            alignment_result=ctx.coarse_alignment,
-            debug={
-                "audio_quality_gate_passed": ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None,
-                "coarse_token_alignment_gate_passed": True,
-                "alignment_confidence_gate_passed": None,
-                "coarse_similarity": ctx.coarse_alignment.normalized_score,
-                "coarse_similarity_threshold": ctx.coarse_similarity_threshold,
-                "alignment_error": str(exc),
-            },
+        ctx.acceptance_notes.append(
+            "Forced alignment failed but evaluation continued under soft-accept policy. "
+            f"error={exc}"
         )
+        ctx.alignment_notes.append(f"Forced alignment failed: {exc}")
     return None
 
 
 def alignment_confidence_gate(ctx: PipelineContext) -> EvaluationResult | None:
-    """Check whether the frame-level forced alignment is reliable enough."""
+    """Record forced-alignment confidence failures while keeping accepted output."""
 
     assert ctx.coarse_alignment is not None and ctx.forced_alignment is not None and ctx.recognition is not None
 
@@ -504,38 +500,11 @@ def alignment_confidence_gate(ctx: PipelineContext) -> EvaluationResult | None:
     if ctx.alignment_confidence.passed:
         return None
 
-    # Forced alignment가 실패해도 coarse alignment 기반 점수는 분석용으로 저장한다.
-    # 단, 이 점수는 최종 점수가 아니라 debug/reference용이다.
-    scoring_start = time.perf_counter()
-    ctx.score_breakdown = build_score_breakdown(ctx.coarse_alignment)
-    issues = classify_alignment_errors(ctx.coarse_alignment, profile=ctx.profile)
-    ctx.feedback_report = build_feedback_report(issues, ctx.score_breakdown, profile=ctx.profile)
-    ctx.stage_latencies_ms["scoring_ms"] = (time.perf_counter() - scoring_start) * 1000.0
-
-    return make_evaluation_result(
-        ctx,
-        status="discarded",
-        message=(
-            "Forced alignment confidence gate failed. "
-            "Coarse score is provided for debugging, but should not be used as final pronunciation score."
-        ),
-        alignment_result=ctx.coarse_alignment,
-        forced_alignment_result=ctx.forced_alignment,
-        alignment_confidence_report=ctx.alignment_confidence,
-        score_breakdown=ctx.score_breakdown,
-        feedback_report=ctx.feedback_report,
-        debug={
-            "audio_quality_gate_passed": ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None,
-            "coarse_token_alignment_gate_passed": True,
-            "alignment_confidence_gate_passed": False,
-            "coarse_similarity": ctx.coarse_alignment.normalized_score,
-            "coarse_similarity_threshold": ctx.coarse_similarity_threshold,
-            "score_source": "coarse_token_alignment",
-            "score_is_final": False,
-            "score_available_for_debug": True,
-        },
+    ctx.acceptance_notes.append(
+        "Forced alignment confidence gate failed but evaluation continued under soft-accept policy. "
+        f"message={ctx.alignment_confidence.message}"
     )
-
+    return None
 
 def scoring_and_error_stage(ctx: PipelineContext) -> None:
     """Create score breakdown and pronunciation issue analysis."""
@@ -551,23 +520,35 @@ def make_ready_result(ctx: PipelineContext) -> EvaluationResult:
 
     assert (
         ctx.coarse_alignment is not None
-        and ctx.forced_alignment is not None
-        and ctx.alignment_confidence is not None
         and ctx.recognition is not None
+    )
+    audio_gate_passed = ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None
+    coarse_gate_passed = ctx.coarse_alignment.normalized_score >= ctx.coarse_similarity_threshold
+    alignment_gate_passed = ctx.alignment_confidence.passed if ctx.alignment_confidence is not None else False
+    all_gates_passed = (
+        audio_gate_passed is not False
+        and coarse_gate_passed
+        and alignment_gate_passed
+    )
+    status_message = (
+        "Audio quality, coarse similarity, and forced alignment confidence gates passed."
+        if all_gates_passed
+        else "Accepted with warnings; one or more quality/alignment gates failed under soft-accept policy."
     )
     return make_evaluation_result(
         ctx,
         status="ready",
-        message="Audio quality, coarse similarity, and forced alignment confidence gates passed.",
+        message=status_message,
         alignment_result=ctx.coarse_alignment,
         score_breakdown=ctx.score_breakdown,
         feedback_report=ctx.feedback_report,
         forced_alignment_result=ctx.forced_alignment,
         alignment_confidence_report=ctx.alignment_confidence,
         debug={
-            "audio_quality_gate_passed": ctx.recognition.quality_report.passed if ctx.recognition.quality_report else None,
-            "coarse_token_alignment_gate_passed": True,
-            "alignment_confidence_gate_passed": True,
+            "audio_quality_gate_passed": audio_gate_passed,
+            "coarse_token_alignment_gate_passed": coarse_gate_passed,
+            "alignment_confidence_gate_passed": alignment_gate_passed,
+            "soft_accept_policy_applied": not all_gates_passed,
             "coarse_similarity": ctx.coarse_alignment.normalized_score,
             "coarse_similarity_threshold": ctx.coarse_similarity_threshold,
             "frame_confidence_preview": ctx.recognition.frame_confidence[:10] if ctx.recognition.frame_confidence else [],
@@ -603,6 +584,8 @@ def make_evaluation_result(
         debug_payload.update(debug)
     if ctx.alignment_notes:
         debug_payload["alignment_notes"] = ctx.alignment_notes
+    if ctx.acceptance_notes:
+        debug_payload["acceptance_notes"] = ctx.acceptance_notes
     if ctx.stage_latencies_ms:
         debug_payload["stage_latencies_ms"] = dict(ctx.stage_latencies_ms)
     alignment_for_debug = forced_alignment_result or ctx.forced_alignment
@@ -615,10 +598,44 @@ def make_evaluation_result(
         if alignment_gate_passed is None and alignment_confidence_report is not None:
             alignment_gate_passed = alignment_confidence_report.passed
         debug_payload["alignment_timing_warnings"] = timing_summary
-        debug_payload["prosody_alignment_usage"] = decide_prosody_alignment_usage(
+        prosody_usage = decide_prosody_alignment_usage(
             timing_summary,
             evaluation_status=status,
             alignment_gate_passed=alignment_gate_passed,
+        )
+        soft_accept_limited_by: list[str] = []
+        if debug_payload.get("audio_quality_gate_passed") is False:
+            soft_accept_limited_by.append("audio_quality")
+        if debug_payload.get("coarse_token_alignment_gate_passed") is False:
+            soft_accept_limited_by.append("coarse_alignment")
+        if soft_accept_limited_by:
+            prosody_usage = dict(prosody_usage)
+            prosody_usage["alignment_for_prosody"] = False
+            prosody_usage["detailed_timing_allowed"] = False
+            prosody_usage["recommended_usage"] = "disabled"
+            reasons = list(prosody_usage.get("reasons") or [])
+            for reason in soft_accept_limited_by:
+                reason_key = f"{reason}_gate_failed"
+                if reason_key not in reasons:
+                    reasons.append(reason_key)
+            if "soft_accept_policy_applied" not in reasons:
+                reasons.append("soft_accept_policy_applied")
+            prosody_usage["reasons"] = reasons
+            limited_by = list(prosody_usage.get("limited_by") or [])
+            for name in soft_accept_limited_by:
+                if name not in limited_by:
+                    limited_by.append(name)
+            prosody_usage["limited_by"] = limited_by
+            limitation_causes = dict(prosody_usage.get("limitation_causes") or {})
+            for name in soft_accept_limited_by:
+                limitation_causes[name] = True
+            prosody_usage["limitation_causes"] = limitation_causes
+        debug_payload["prosody_alignment_usage"] = prosody_usage
+    elif status == "ready":
+        debug_payload["prosody_alignment_usage"] = decide_prosody_alignment_usage(
+            None,
+            evaluation_status=status,
+            alignment_gate_passed=False,
         )
 
     return EvaluationResult(
@@ -671,6 +688,7 @@ def run_evaluation(
         profile=profile,
         coarse_similarity_threshold=coarse_similarity_threshold,
         recognizer=recognizer or get_default_recognizer(),
+        alignment_calibration_stats=load_confidence_calibration(),
     )
 
     _time_stage(ctx, "build_reference_ms", lambda: build_reference_stage(ctx))
@@ -689,9 +707,12 @@ def run_evaluation(
     if early_result is not None:
         return _attach_stage_latencies(early_result, ctx)
 
-    early_result = _time_stage(ctx, "confidence_gate_ms", lambda: alignment_confidence_gate(ctx))
-    if early_result is not None:
-        return _attach_stage_latencies(early_result, ctx)
+    if ctx.forced_alignment is not None:
+        early_result = _time_stage(ctx, "confidence_gate_ms", lambda: alignment_confidence_gate(ctx))
+        if early_result is not None:
+            return _attach_stage_latencies(early_result, ctx)
+    else:
+        ctx.stage_latencies_ms["confidence_gate_ms"] = 0.0
 
     _time_stage(ctx, "scoring_ms", lambda: scoring_and_error_stage(ctx))
     return make_ready_result(ctx)
@@ -775,6 +796,9 @@ def build_backend_payload(
             payload["prosody_input"]["alignment_for_prosody"] = usage["alignment_for_prosody"]
             payload["prosody_input"]["detailed_timing_allowed"] = usage["detailed_timing_allowed"]
             payload["prosody_input"]["prosody_recommended_usage"] = usage["recommended_usage"]
+    else:
+        payload["prosody_input"]["excluded_reference_tail"] = []
+        payload["prosody_input"]["alignment_is_partial"] = False
 
     return {
         "status": payload["status"],
